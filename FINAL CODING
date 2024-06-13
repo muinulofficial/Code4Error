@@ -1,0 +1,314 @@
+package javafxapplication1;
+
+
+import javafx.application.Application;
+import javafx.collections.FXCollections;
+import javafx.collections.ObservableList;
+import javafx.geometry.Insets;
+import javafx.scene.Scene;
+import javafx.scene.chart.*;
+import javafx.scene.control.Label;
+import javafx.scene.control.ScrollPane;
+import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableView;
+import javafx.scene.control.cell.PropertyValueFactory;
+import javafx.scene.layout.VBox;
+import javafx.stage.Stage;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class JobFXApp extends Application {
+
+    // Path to the log file
+    private static final String logFilePath = "extracted_log.txt";
+
+    // Variables for job partition counting
+    private List<String> partitions = new ArrayList<>();
+    private List<Integer> partitionCounts = new ArrayList<>();
+
+    // Variables for job timing and error counting
+    private LocalDateTime startTime = null;
+    private LocalDateTime endTime = null;
+    private int createdCount = 0;
+    private int endedCount = 0;
+    private int errorJobs = 0;
+    private int completedWithZero = 0;
+    private int completedWithPositive = 0;
+    private int killedJobs = 0; // Counter for killed jobs
+    private Map<String, Integer> userErrorCount = new HashMap<>();
+    private long totalExecutionTimeSeconds = 0; // Total execution time in seconds
+    private int jobCount = 0; // Total number of jobs
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+
+    @Override
+    public void start(Stage primaryStage) {
+        // Load log data
+        loadData();
+
+        // Create UI components
+        VBox root = new VBox(10);
+        root.setPadding(new Insets(10));
+
+        // Job partition counts
+        root.getChildren().add(new Label("Job Partition Counts:"));
+        TableView<PartitionCount> partitionTable = createPartitionTable();
+        BarChart<String, Number> partitionChart = createPartitionChart();
+        root.getChildren().addAll(partitionTable, partitionChart);
+
+        // Job timing information
+        root.getChildren().add(new Label("Job Timing Information:"));
+        root.getChildren().add(new Label("Start Time: " + startTime));
+        root.getChildren().add(new Label("End Time: " + endTime));
+        root.getChildren().add(new Label("Number of Jobs Created: " + createdCount));
+        root.getChildren().add(new Label("Number of Jobs Ended: " + endedCount));
+
+        // Job error information
+        root.getChildren().add(new Label("Job Error Information:"));
+        TableView<UserError> errorTable = createUserErrorTable();
+        BarChart<String, Number> errorChart = createErrorChart();
+        root.getChildren().addAll(errorTable, errorChart);
+
+        // Job completion information
+        root.getChildren().add(new Label("Job Completion Information:"));
+        root.getChildren().add(new Label("Number of Jobs Completed with WEXITSTATUS 0: " + completedWithZero));
+        root.getChildren().add(new Label("Number of Jobs Completed with Positive WEXITSTATUS: " + completedWithPositive));
+
+        // Job killed information
+        root.getChildren().add(new Label("Number of Jobs Killed: " + killedJobs));
+
+        // Average execution time
+        root.getChildren().add(new Label("Job Execution Time:"));
+        if (jobCount > 0) {
+            long averageExecutionTimeSeconds = totalExecutionTimeSeconds / jobCount;
+            root.getChildren().add(new Label("Average Execution Time of Jobs: " + formatDuration(Duration.ofSeconds(averageExecutionTimeSeconds))));
+        } else {
+            root.getChildren().add(new Label("No jobs found to calculate average execution time."));
+        }
+
+        // Wrap the VBox in a ScrollPane
+        ScrollPane scrollPane = new ScrollPane(root);
+        scrollPane.setFitToWidth(true); // Ensures the ScrollPane fits to the width of the content
+
+        // Set up the scene and stage
+        Scene scene = new Scene(scrollPane, 800, 1000);
+        primaryStage.setTitle("Job Log Analysis");
+        primaryStage.setScene(scene);
+        primaryStage.show();
+    }
+
+    private void loadData() {
+        Pattern allocatePattern = Pattern.compile("sched: Allocate");
+        Pattern submitPattern = Pattern.compile("_slurm_rpc_submit_batch_job");
+        Pattern completePattern = Pattern.compile("_job_complete");
+        Pattern errorPattern = Pattern.compile("error:.*user='(\\S+)'");
+        Pattern exitStatusPattern = Pattern.compile("_job_complete: JobId=(\\d+) WEXITSTATUS (\\d+)");
+        Pattern killPattern = Pattern.compile("_slurm_rpc_kill_job"); // Pattern to match killed jobs
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(logFilePath))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                // Job partition counting
+                Matcher allocateMatcher = allocatePattern.matcher(line);
+                if (allocateMatcher.find()) {
+                    String partition = line.substring(line.lastIndexOf("Partition=") + 10).trim();
+                    int index = partitions.indexOf(partition);
+                    if (index == -1) {
+                        partitions.add(partition);
+                        partitionCounts.add(1);
+                    } else {
+                        partitionCounts.set(index, partitionCounts.get(index) + 1);
+                    }
+                }
+
+                // Job timing and error counting
+                LocalDateTime timestamp = LocalDateTime.parse(line.substring(1, 24), DateTimeFormatter.ISO_DATE_TIME);
+                if (startTime == null || timestamp.isBefore(startTime)) {
+                    startTime = timestamp;
+                }
+                if (endTime == null || timestamp.isAfter(endTime)) {
+                    endTime = timestamp;
+                }
+                if (submitPattern.matcher(line).find()) {
+                    createdCount++;
+                } else if (completePattern.matcher(line).find()) {
+                    endedCount++;
+                    Matcher exitStatusMatcher = exitStatusPattern.matcher(line);
+                    if (exitStatusMatcher.find()) {
+                        int exitStatus = Integer.parseInt(exitStatusMatcher.group(2));
+                        if (exitStatus == 0) {
+                            completedWithZero++;
+                        } else {
+                            completedWithPositive++;
+                        }
+                    }
+
+                    // Calculate job execution time
+                    Duration executionTime = calculateExecutionTime(startTime, timestamp);
+                    totalExecutionTimeSeconds += executionTime.getSeconds();
+                    jobCount++;
+                }
+
+                // Counting job errors
+                Matcher errorMatcher = errorPattern.matcher(line);
+                if (errorMatcher.find()) {
+                    errorJobs++;
+                    String user = errorMatcher.group(1);
+                    userErrorCount.put(user, userErrorCount.getOrDefault(user, 0) + 1);
+                }
+
+                // Counting killed jobs
+                if (killPattern.matcher(line).find()) {
+                    killedJobs++;
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Error reading the log file: " + e.getMessage());
+        }
+    }
+
+    // Create a table for job partition counts
+    private TableView<PartitionCount> createPartitionTable() {
+        TableView<PartitionCount> table = new TableView<>();
+        table.setPrefHeight(200);
+
+        TableColumn<PartitionCount, String> partitionColumn = new TableColumn<>("Partition");
+        partitionColumn.setCellValueFactory(new PropertyValueFactory<>("partition"));
+
+        TableColumn<PartitionCount, Integer> countColumn = new TableColumn<>("Count");
+        countColumn.setCellValueFactory(new PropertyValueFactory<>("count"));
+
+        table.getColumns().add(partitionColumn);
+        table.getColumns().add(countColumn);
+
+        ObservableList<PartitionCount> data = FXCollections.observableArrayList();
+        for (int i = 0; i < partitions.size(); i++) {
+            data.add(new PartitionCount(partitions.get(i), partitionCounts.get(i)));
+        }
+        table.setItems(data);
+
+        return table;
+    }
+
+    // Create a table for user error counts
+    private TableView<UserError> createUserErrorTable() {
+        TableView<UserError> table = new TableView<>();
+        table.setPrefHeight(200);
+
+        TableColumn<UserError, String> userColumn = new TableColumn<>("User");
+        userColumn.setCellValueFactory(new PropertyValueFactory<>("user"));
+
+        TableColumn<UserError, Integer> errorCountColumn = new TableColumn<>("Error Count");
+        errorCountColumn.setCellValueFactory(new PropertyValueFactory<>("errorCount"));
+
+        table.getColumns().add(userColumn);
+        table.getColumns().add(errorCountColumn);
+
+        ObservableList<UserError> data = FXCollections.observableArrayList();
+        for (Map.Entry<String, Integer> entry : userErrorCount.entrySet()) {
+            data.add(new UserError(entry.getKey(), entry.getValue()));
+        }
+        table.setItems(data);
+
+        return table;
+    }
+
+    // Create a bar chart for job partition counts
+    private BarChart<String, Number> createPartitionChart() {
+        CategoryAxis xAxis = new CategoryAxis();
+        xAxis.setLabel("Partition");
+        NumberAxis yAxis = new NumberAxis();
+        yAxis.setLabel("Count");
+
+        BarChart<String, Number> barChart = new BarChart<>(xAxis, yAxis);
+        barChart.setTitle("Job Partition Counts");
+
+        XYChart.Series<String, Number> dataSeries = new XYChart.Series<>();
+        for (int i = 0; i < partitions.size(); i++) {
+            dataSeries.getData().add(new XYChart.Data<>(partitions.get(i), partitionCounts.get(i)));
+        }
+
+        barChart.getData().add(dataSeries);
+        return barChart;
+    }
+
+    // Create a bar chart for user error counts
+    private BarChart<String, Number> createErrorChart() {
+        CategoryAxis xAxis = new CategoryAxis();
+        xAxis.setLabel("User");
+        NumberAxis yAxis = new NumberAxis();
+        yAxis.setLabel("Error Count");
+
+        BarChart<String, Number> barChart = new BarChart<>(xAxis, yAxis);
+        barChart.setTitle("User Error Counts");
+
+        XYChart.Series<String, Number> dataSeries = new XYChart.Series<>();
+        for (Map.Entry<String, Integer> entry : userErrorCount.entrySet()) {
+            dataSeries.getData().add(new XYChart.Data<>(entry.getKey(), entry.getValue()));
+        }
+
+        barChart.getData().add(dataSeries);
+        return barChart;
+    }
+
+    // Method to calculate execution time between two timestamps
+    private static Duration calculateExecutionTime(LocalDateTime start, LocalDateTime end) {
+        return Duration.between(start, end);
+    }
+
+    // Method to format duration in HH:mm:ss format
+    private static String formatDuration(Duration duration) {
+        long hours = duration.toHours();
+        long minutes = duration.toMinutesPart();
+        long seconds = duration.toSecondsPart();
+        return String.format("%02d:%02d:%02d", hours, minutes, seconds);
+    }
+
+    // Class for holding partition count data for the table
+    public static class PartitionCount {
+        private final String partition;
+        private final int count;
+
+        public PartitionCount(String partition, int count) {
+            this.partition = partition;
+            this.count = count;
+        }
+
+        public String getPartition() {
+            return partition;
+        }
+
+        public int getCount() {
+            return count;
+        }
+    }
+
+    // Class for holding user error data for the table
+    public static class UserError {
+        private final String user;
+        private final int errorCount;
+
+        public UserError(String user, int errorCount) {
+            this.user = user;
+            this.errorCount = errorCount;
+        }
+
+        public String getUser() {
+            return user;
+        }
+
+        public int getErrorCount() {
+            return errorCount;
+        }
+    }
+}
